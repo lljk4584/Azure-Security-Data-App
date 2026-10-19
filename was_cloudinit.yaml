@@ -1,0 +1,254 @@
+#cloud-config
+# WAS 계층: Flask 앱 서버. 부팅 시 id-mysql(관리자)로 최소권한 앱 유저(was_app)를 만들고,
+# 앱은 id-was-app 관리 ID의 Entra 토큰으로 MySQL에 접속한다. (비밀번호 미사용)
+package_update: true
+packages:
+  - python3-flask
+  - python3-pymysql
+  - gunicorn
+  - mysql-client
+  - auditd
+  - audispd-plugins
+
+write_files:
+  - path: /etc/rsyslog.d/00-team4-norepeat.conf
+    permissions: "0644"
+    content: |
+      $RepeatedMsgReduction off
+  # auditd(FIM): 계정·sudoers·SSH키 변조와 권한상승 명령 감시 → audisp-syslog 로 local6 → LAW
+  - path: /etc/audit/rules.d/team4-fim.rules
+    permissions: "0640"
+    content: |
+      -w /etc/passwd -p wa -k identity
+      -w /etc/shadow -p wa -k identity
+      -w /etc/group -p wa -k identity
+      -w /etc/gshadow -p wa -k identity
+      -w /etc/sudoers -p wa -k priv_esc
+      -w /etc/sudoers.d/ -p wa -k priv_esc
+      -w /root/.ssh/ -p wa -k ssh_keys
+      -w /etc/ssh/sshd_config -p wa -k ssh_config
+      -w /usr/sbin/useradd -p x -k user_mgmt
+      -w /usr/sbin/usermod -p x -k user_mgmt
+      -w /usr/sbin/groupadd -p x -k user_mgmt
+      -w /usr/bin/passwd -p x -k user_mgmt
+      -w /usr/bin/sudo -p x -k priv_esc_exec
+      -w /bin/su -p x -k priv_esc_exec
+  - path: /etc/audit/plugins.d/syslog.conf
+    permissions: "0640"
+    content: |
+      active = yes
+      direction = out
+      path = /sbin/audisp-syslog
+      type = always
+      args = LOG_LOCAL6
+      format = string
+  - path: /opt/app/app.py
+    permissions: "0644"
+    content: |
+      from flask import Flask, request, redirect, session
+      from werkzeug.security import generate_password_hash, check_password_hash
+      from markupsafe import escape
+      import pymysql, config, os, json, urllib.request, logging, logging.handlers
+      app = Flask(__name__)
+      app.secret_key = os.urandom(24)
+
+      authlog = logging.getLogger('team4auth')
+      authlog.setLevel(logging.INFO)
+      _sh = logging.handlers.SysLogHandler(
+          address='/dev/log',
+          facility=logging.handlers.SysLogHandler.LOG_AUTHPRIV)
+      _sh.setFormatter(logging.Formatter('team4login: %(message)s'))
+      authlog.addHandler(_sh)
+
+      def client_ip():
+          xff = request.headers.get('X-Forwarded-For', '')
+          if xff:
+              return xff.split(',')[0].strip().split(':')[0]
+          return request.remote_addr or '-'
+
+      # 앱 전용 관리 ID(id-was-app)로 MySQL용 Entra 액세스 토큰을 발급받아 "비밀번호" 자리에 사용
+      def _db_token():
+          url = ("http://169.254.169.254/metadata/identity/oauth2/token"
+                 "?api-version=2018-02-01"
+                 "&resource=https://ossrdbms-aad.database.windows.net"
+                 "&client_id=" + config.APP_CLIENT_ID)
+          req = urllib.request.Request(url, headers={"Metadata": "true"})
+          return json.load(urllib.request.urlopen(req, timeout=5))["access_token"]
+
+      def get_conn():
+          return pymysql.connect(
+              host=config.DB_HOST, user=config.DB_USER, password=_db_token(),
+              database=config.DB_NAME,
+              ssl={'ca': '/etc/ssl/certs/ca-certificates.crt'},
+              cursorclass=pymysql.cursors.DictCursor, connect_timeout=5)
+
+      def page(title, body):
+          return (
+              '<!doctype html><html lang="ko"><head><meta charset="utf-8">'
+              '<meta name="viewport" content="width=device-width, initial-scale=1">'
+              '<title>' + title + ' | team4</title>'
+              '<link rel="stylesheet" href="/static/style.css"></head><body>'
+              '<header><h1>team4 프로젝트</h1></header>'
+              '<main>' + body + '</main></body></html>')
+
+      def msg(text, kind='err'):
+          return '<div class="msg %s">%s</div>' % (kind, escape(text))
+
+      def safe_check(hashed, plain):
+          try:
+              return check_password_hash(hashed, plain)
+          except Exception:
+              return False
+
+      def signup_form(v=None):
+          v = v or {}
+          return (
+              '<div class="card"><h2>회원가입</h2>'
+              '<form class="form" method="post" action="/signup">'
+              '<label>아이디<input name="username" value="%s" required></label>'
+              '<label>비밀번호<input name="password" type="password" required></label>'
+              '<label>이메일<input name="email" value="%s"></label>'
+              '<label>전화<input name="phone" value="%s"></label>'
+              '<label>부서<input name="dept" value="%s"></label>'
+              '<button type="submit">가입하기</button></form>'
+              '<p class="hint">이미 계정이 있으면 <a href="/login">로그인</a></p></div>'
+          ) % (escape(v.get('username','')), escape(v.get('email','')),
+               escape(v.get('phone','')), escape(v.get('dept','')))
+
+      def login_form():
+          return (
+              '<div class="card"><h2>로그인</h2>'
+              '<form class="form" method="post" action="/login">'
+              '<label>아이디<input name="username" required></label>'
+              '<label>비밀번호<input name="password" type="password" required></label>'
+              '<button type="submit">로그인</button></form>'
+              '<p class="hint">계정이 없으면 <a href="/signup">회원가입</a></p></div>')
+
+      @app.route('/')
+      def home():
+          if session.get('user'):
+              return page('로그인 성공',
+                          '<div class="card"><h2>로그인 성공</h2>'
+                          '<p><a href="/logout">로그아웃</a></p></div>')
+          return redirect('/login')
+
+      @app.route('/health')
+      def health():
+          return 'ok'
+
+      @app.route('/signup', methods=['GET', 'POST'])
+      def signup():
+          if request.method == 'POST':
+              f = request.form
+              u = f.get('username', '').strip()
+              p = f.get('password', '')
+              if not u or not p:
+                  return page('회원가입', msg('아이디와 비밀번호는 필수입니다.') + signup_form(f))
+              conn = get_conn(); cur = conn.cursor()
+              cur.execute('SELECT id FROM members WHERE username=%s', (u,))
+              if cur.fetchone():
+                  conn.close()
+                  return page('회원가입', msg('이미 존재하는 아이디입니다.') + signup_form(f))
+              cur.execute(
+                  'INSERT INTO members (username, password, email, phone, dept) '
+                  'VALUES (%s, %s, %s, %s, %s)',
+                  (u, generate_password_hash(p), f.get('email', '').strip(),
+                   f.get('phone', '').strip(), f.get('dept', '').strip()))
+              conn.commit(); conn.close()
+              body = ('<div class="card"><h2>가입 완료</h2>'
+                      '<p><b>%s</b> 님, 가입이 완료되었습니다.</p>'
+                      '<p><a href="/login">로그인하러 가기 &rarr;</a></p></div>') % escape(u)
+              return page('가입 완료', body)
+          return page('회원가입', signup_form())
+
+      @app.route('/login', methods=['GET', 'POST'])
+      def login():
+          if request.method == 'POST':
+              u = request.form.get('username', '').strip()
+              p = request.form.get('password', '')
+              conn = get_conn(); cur = conn.cursor()
+              cur.execute('SELECT username, password FROM members WHERE username=%s', (u,))
+              row = cur.fetchone(); conn.close()
+              if row and row['password'] and safe_check(row['password'], p):
+                  session['user'] = row['username']
+                  authlog.info('TEAM4_LOGIN result=OK user="%s" src=%s'
+                               % (row['username'], client_ip()))
+                  return redirect('/')
+              authlog.warning('TEAM4_LOGIN result=FAIL user="%s" src=%s'
+                              % (u, client_ip()))
+              return page('로그인', msg('아이디 또는 비밀번호가 올바르지 않습니다.') + login_form())
+          return page('로그인', login_form())
+
+      @app.route('/logout')
+      def logout():
+          session.pop('user', None)
+          return redirect('/login')
+  - path: /etc/systemd/system/app.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=team4 WAS (Flask)
+      After=network.target
+      [Service]
+      WorkingDirectory=/opt/app
+      ExecStart=/usr/bin/gunicorn -b 0.0.0.0:8080 app:app
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+  # 프로비저닝 SQL을 별도 파일로 분리(heredoc 미사용 → YAML 들여쓰기 충돌 방지).
+  # 치환 자리(app_login/app_object_id/db_name)는 Terraform templatefile 이 채운다.
+  - path: /opt/app/provision.sql
+    permissions: "0644"
+    content: |
+      SET aad_auth_validate_oids_in_tenant = OFF;
+      CREATE AADUSER '${app_login}' IDENTIFIED BY '${app_object_id}';
+      GRANT SELECT, INSERT, UPDATE, DELETE ON `${db_name}`.* TO '${app_login}';
+      CREATE TABLE IF NOT EXISTS `${db_name}`.members (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) UNIQUE,
+        password VARCHAR(255),
+        email VARCHAR(100),
+        phone VARCHAR(30),
+        dept VARCHAR(50)
+      );
+      FLUSH PRIVILEGES;
+  - path: /opt/app/setup.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+      HOST="${mysql_fqdn}"; DB="${db_name}"
+      ADMIN_LOGIN="${admin_login}"; ADMIN_CID="${admin_client_id}"
+      APP_LOGIN="${app_login}"; APP_CID="${app_client_id}"; APP_OID="${app_object_id}"
+
+      # 지정한 관리 ID(client_id)로 MySQL용 Entra 액세스 토큰 발급
+      tok() {
+        curl -s -H Metadata:true \
+          "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://ossrdbms-aad.database.windows.net&client_id=$1" \
+          | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])'
+      }
+
+      # 앱이 런타임에 쓸 설정 (앱은 was_app + id-was-app 토큰으로 접속)
+      printf 'DB_HOST="%s"\nDB_USER="%s"\nDB_NAME="%s"\nAPP_CLIENT_ID="%s"\n' \
+        "$HOST" "$APP_LOGIN" "$DB" "$APP_CID" > /opt/app/config.py
+
+      # 프로비저닝: 관리자(id-mysql) 토큰으로 접속해 최소권한 앱 유저 + 스키마 생성
+      # --force: 앱 유저가 이미 있어도(재배포) 나머지 구문은 계속 실행
+      for i in $(seq 1 12); do
+        ADMIN_TOKEN=$(tok "$ADMIN_CID")
+        if mysql -h "$HOST" -u "$ADMIN_LOGIN" --enable-cleartext-plugin --ssl-mode=REQUIRED -p"$ADMIN_TOKEN" --force < /opt/app/provision.sql
+        then
+          echo "provision ok"; break
+        fi
+        echo "provision retry $i (DB 준비중일 수 있음)"; sleep 15
+      done
+
+      systemctl daemon-reload
+      systemctl enable --now app
+
+runcmd:
+  - systemctl restart rsyslog
+  - bash /opt/app/setup.sh
+  - augenrules --load
+  - systemctl enable auditd
+  - service auditd restart

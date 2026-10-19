@@ -1,0 +1,30 @@
+subid = "00000000-0000-0000-0000-000000000000"
+loca  = "koreacentral"
+
+project_prefix   = "team4"
+rgname           = "INFRA-RG"
+security_rg_name = "Security-RG"
+
+appgw_dns_label          = "team4-appgw"
+domain_name              = "<YOUR_DOMAIN>"
+pfx_path                 = "C:/team4/team4-fullchain.pfx"
+web_admin_ssh_public_key = "ssh-rsa AAAA...YOUR_PUBLIC_KEY..."
+
+mysql_server_name           = "team4-mysql"
+mysql_entra_admin_object_id = "<보안 관리자 Object ID>"
+app_db_name                 = "emp_db"
+
+key_vault_name       = "team4-kv"
+storage_account_name = "team4storage"
+
+security_admins = ["<Object ID>"]
+infra_admins    = ["<Object ID>"]
+service_admins  = ["<Object ID>"]
+cso             = ["<Object ID>"]
+
+admin_public_ip    = "<관리자 공인 IP>"
+alert_email        = "<알림 받을 이메일>"
+alert_email_backup = "<백업 알림 이메일>"
+
+# PFX 비밀번호는 파일에 적지 말고 환경 변수로
+# PowerShell: $env:TF_VAR_pfx_password = "..."

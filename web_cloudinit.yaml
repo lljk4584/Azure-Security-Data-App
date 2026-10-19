@@ -1,0 +1,147 @@
+#cloud-config
+# Web 계층: nginx. 정적 파일(/static/)은 web-vm이 직접 서빙, 동적 요청(/)은 WAS(8080)로 프록시.
+# AppGW→web 백엔드 구간을 HTTPS(443)로 종단한다. 인증서는 AppGW가 쓰는 "그 도메인 인증서"를
+# web-vm의 관리 ID(Key Vault Secrets User)로 KV에서 받아 그대로 사용한다. (새 인증서 생성 없음)
+# /health.html은 App GW 프로브용으로 로컬에서 응답.
+package_update: true
+packages:
+  - nginx
+  - openssl
+  - auditd
+  - audispd-plugins
+
+write_files:
+  - path: /var/www/html/health.html
+    permissions: "0644"
+    content: |
+      ok
+  - path: /var/www/html/static/style.css
+    permissions: "0644"
+    content: |
+      :root { --navy:#1f3a5f; --line:#d7dee8; --bg:#f4f6fa; }
+      * { box-sizing:border-box; }
+      body { margin:0; font-family:"Segoe UI",Roboto,"Noto Sans KR",sans-serif;
+             background:var(--bg); color:#1b2430; }
+      header { background:var(--navy); color:#fff; padding:18px 28px; }
+      header h1 { margin:0; font-size:20px; letter-spacing:.5px; }
+      header .sub { font-size:12px; opacity:.8; margin-top:4px; }
+      nav { padding:12px 28px; background:#fff; border-bottom:1px solid var(--line);
+            display:flex; justify-content:space-between; align-items:center; }
+      nav a { margin-right:18px; color:var(--navy); text-decoration:none; font-weight:600; font-size:14px; }
+      nav .right a { margin-right:0; margin-left:18px; }
+      nav a:hover { text-decoration:underline; }
+      nav .who { font-size:13px; color:#55617a; margin-right:4px; }
+      main { padding:28px; }
+      .card { background:#fff; border:1px solid var(--line); border-radius:10px;
+              padding:22px 26px; max-width:960px; box-shadow:0 1px 3px rgba(0,0,0,.05); }
+      h2 { margin-top:0; color:var(--navy); font-size:18px; }
+      table { width:100%; border-collapse:collapse; margin-top:14px; font-size:14px; }
+      th, td { padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); }
+      th { background:#eef2f8; color:var(--navy); font-weight:700; }
+      tr:hover td { background:#f8fafc; }
+      .tag { display:inline-block; padding:2px 10px; border-radius:12px;
+             background:#e8eef7; color:var(--navy); font-size:12px; }
+      .form { display:flex; flex-direction:column; gap:14px; max-width:360px; margin-top:16px; }
+      .form label { display:flex; flex-direction:column; font-size:13px; font-weight:600; color:#44506a; gap:6px; }
+      .form input { padding:10px 12px; border:1px solid var(--line); border-radius:7px; font-size:14px; }
+      .form input:focus { outline:none; border-color:var(--navy); }
+      .form button { margin-top:4px; padding:11px; background:var(--navy); color:#fff; border:none;
+                     border-radius:7px; font-size:15px; font-weight:600; cursor:pointer; }
+      .form button:hover { background:#28496f; }
+      .hint { margin-top:14px; font-size:13px; color:#6b7688; }
+      .msg { max-width:420px; margin:0 0 16px; padding:11px 14px; border-radius:7px; font-size:14px; }
+      .msg.err { background:#fdecec; color:#b4231f; border:1px solid #f3c2c0; }
+      .msg.ok { background:#eaf6ed; color:#1d7a3a; border:1px solid #bfe3c8; }
+      footer { padding:18px 28px; color:#8a95a5; font-size:12px; }
+  # auditd(FIM): 계정·sudoers·SSH키 변조와 권한상승 명령을 감시 → audisp-syslog 로 local6 → LAW
+  - path: /etc/audit/rules.d/team4-fim.rules
+    permissions: "0640"
+    content: |
+      -w /etc/passwd -p wa -k identity
+      -w /etc/shadow -p wa -k identity
+      -w /etc/group -p wa -k identity
+      -w /etc/gshadow -p wa -k identity
+      -w /etc/sudoers -p wa -k priv_esc
+      -w /etc/sudoers.d/ -p wa -k priv_esc
+      -w /root/.ssh/ -p wa -k ssh_keys
+      -w /etc/ssh/sshd_config -p wa -k ssh_config
+      -w /usr/sbin/useradd -p x -k user_mgmt
+      -w /usr/sbin/usermod -p x -k user_mgmt
+      -w /usr/sbin/groupadd -p x -k user_mgmt
+      -w /usr/bin/passwd -p x -k user_mgmt
+      -w /usr/bin/sudo -p x -k priv_esc_exec
+      -w /bin/su -p x -k priv_esc_exec
+  - path: /etc/audit/plugins.d/syslog.conf
+    permissions: "0640"
+    content: |
+      active = yes
+      direction = out
+      path = /sbin/audisp-syslog
+      type = always
+      args = LOG_LOCAL6
+      format = string
+  - path: /opt/web/fetch_cert.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+      mkdir -p /etc/nginx/ssl
+      KV_URI="${kv_uri}"
+      CERT="${cert_name}"
+      # web-vm 관리 ID로 KV 액세스 토큰 발급 → 인증서 시크릿(PKCS12, base64) 수신 → cert/key 추출
+      for i in $(seq 1 12); do
+        TOKEN=$(curl -s -H Metadata:true "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net" | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])' 2>/dev/null || true)
+        PFX=$(curl -s -H "Authorization: Bearer $TOKEN" "$${KV_URI}secrets/$${CERT}?api-version=7.4" | python3 -c 'import sys,json;print(json.load(sys.stdin)["value"])' 2>/dev/null || true)
+        if [ -n "$PFX" ]; then
+          echo "$PFX" | base64 -d > /etc/nginx/ssl/web.pfx
+          if openssl pkcs12 -in /etc/nginx/ssl/web.pfx -nokeys -out /etc/nginx/ssl/web.crt -passin pass: \
+             && openssl pkcs12 -in /etc/nginx/ssl/web.pfx -nocerts -nodes -out /etc/nginx/ssl/web.key -passin pass:; then
+            chmod 600 /etc/nginx/ssl/web.key
+            rm -f /etc/nginx/ssl/web.pfx
+            echo "cert ok"; break
+          fi
+        fi
+        echo "cert fetch retry $i"; sleep 15
+      done
+  - path: /etc/nginx/sites-available/default
+    permissions: "0644"
+    content: |
+      # AppGW 백엔드가 443(HTTPS)로 접속 — KV의 도메인 인증서로 TLS 종단.
+      # 평문 80은 더 이상 열지 않는다(NSG에서도 443만 허용).
+      server {
+        listen 443 ssl default_server;
+        server_name _;
+
+        ssl_certificate     /etc/nginx/ssl/web.crt;
+        ssl_certificate_key /etc/nginx/ssl/web.key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+
+        # App GW 헬스체크: web에서 로컬 응답
+        location = /health.html {
+          root /var/www/html;
+        }
+
+        # 정적 파일: web-vm이 직접 서빙 (WAS로 안 넘어감)
+        location /static/ {
+          root /var/www/html;
+          expires 1h;
+          access_log off;
+        }
+
+        # 동적 요청: WAS(Flask)로 프록시
+        location / {
+          proxy_pass http://${was_ip}:8080;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_connect_timeout 5s;
+        }
+      }
+
+runcmd:
+  - bash /opt/web/fetch_cert.sh
+  - systemctl enable nginx
+  - systemctl restart nginx
+  - augenrules --load
+  - systemctl enable auditd
+  - service auditd restart
